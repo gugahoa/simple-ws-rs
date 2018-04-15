@@ -7,7 +7,7 @@ use mio::net::*;
 use std::time::Duration;
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, ErrorKind};
 use std::io;
 
 struct HttpParser;
@@ -39,14 +39,26 @@ impl WebSocketClient {
             let mut buf = [0; 2048];
             match self.socket.read(&mut buf) {
                 Err(e) => {
-                    println!("Error while reading from socket. {}", e);
-                    return;
+                    match e.kind() {
+                        ErrorKind::Interrupted => {
+                            println!("Read interrupted, try again");
+                        },
+                        ErrorKind::WouldBlock => {
+                            println!("Socket read would block, returning");
+                            return;
+                        },
+                        _ => {
+                            println!("Read socket error. {:?}", e.kind());
+                            return;
+                        }
+                    }
                 },
                 Ok(0) => {
                     println!("Socket has no more bytes to read");
                     break;
                 },
                 Ok(len) => {
+                    println!("Bytes read: {}\nRead {:?}", len, std::str::from_utf8(&buf[0..len]));
                     self.http_parser.parse(&mut HttpParser::new(), &buf[0..len]);
                     if self.http_parser.is_upgrade() {
                         println!("Is HTTP upgrade");
@@ -110,7 +122,7 @@ impl WebSocketServer {
         self.token_counter += 1;
         let new_token = Token(self.token_counter);
 
-        poll.register(&client, new_token, Ready::readable(), PollOpt::edge()).unwrap();
+        poll.register(&client, new_token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
         self.clients.insert(new_token, client);
     }
 }
@@ -132,14 +144,15 @@ fn main() {
                     println!("Received event from websocket");
                     let _ = websocket.accept(&poll);
                 }
-                ref token => {
+                token => {
                     println!("Received event from {:?}", token);
-                    match websocket.clients.get_mut(token) {
+                    match websocket.clients.get_mut(&token) {
                         None => {
                             println!("No client represents this token");
                         },
                         Some(client) => {
                             client.read();
+                            client.reregister(&poll, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
                         }
                     }
                 }
