@@ -1,15 +1,88 @@
 extern crate mio;
+extern crate http_muncher;
+
+use http_muncher::{Parser, ParserHandler};
 use mio::*;
 use mio::net::*;
 use std::time::Duration;
 
 use std::collections::HashMap;
+use std::io::Read;
+use std::io;
+
+struct HttpParser;
+impl ParserHandler for HttpParser {
+
+}
+
+impl HttpParser {
+    fn new() -> HttpParser {
+        HttpParser { }
+    }
+}
+
+struct WebSocketClient {
+    socket: TcpStream,
+    http_parser: Parser,
+}
+
+impl WebSocketClient {
+    pub fn new(socket: TcpStream) -> WebSocketClient {
+        WebSocketClient {
+            socket: socket,
+            http_parser: Parser::request()
+        }
+    }
+
+    pub fn read(&mut self) {
+        loop {
+            let mut buf = [0; 2048];
+            match self.socket.read(&mut buf) {
+                Err(e) => {
+                    println!("Error while reading from socket. {}", e);
+                    return;
+                },
+                Ok(0) => {
+                    println!("Socket has no more bytes to read");
+                    break;
+                },
+                Ok(len) => {
+                    self.http_parser.parse(&mut HttpParser::new(), &buf[0..len]);
+                    if self.http_parser.is_upgrade() {
+                        println!("Is HTTP upgrade");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Evented for WebSocketClient  {
+    fn register(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt)
+        -> io::Result<()>
+    {
+        // Delegate the `register` call to `socket`
+        poll.register(&self.socket, token, interest, opts)
+    }
+
+    fn reregister(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt)
+        -> io::Result<()>
+    {
+        // Delegate the `reregister` call to `socket`
+        poll.reregister(&self.socket, token, interest, opts)
+    }
+
+    fn deregister(&self, poll: &Poll) -> io::Result<()> {
+        // Delegate the `deregister` call to `socket`
+        poll.deregister(&self.socket)
+    }}
 
 const SERVER: Token = Token(0);
 
 struct WebSocketServer {
     socket: TcpListener,
-    clients: HashMap<Token, TcpStream>, // Use `slab` maybe?
+    clients: HashMap<Token, WebSocketClient>, // Use `slab` maybe?
     token_counter: usize,
 }
 
@@ -29,7 +102,9 @@ impl WebSocketServer {
                 println!("Accept error: {}", e);
                 return;
             },
-            Ok((sock, addr)) => sock
+            Ok((sock, _addr)) => {
+                WebSocketClient::new(sock)
+            }
         };
 
         self.token_counter += 1;
@@ -57,8 +132,16 @@ fn main() {
                     println!("Received event from websocket");
                     let _ = websocket.accept(&poll);
                 }
-                Token(token) => {
-                    println!("Received event from {}", token);
+                ref token => {
+                    println!("Received event from {:?}", token);
+                    match websocket.clients.get_mut(token) {
+                        None => {
+                            println!("No client represents this token");
+                        },
+                        Some(client) => {
+                            client.read();
+                        }
+                    }
                 }
             }
         }
