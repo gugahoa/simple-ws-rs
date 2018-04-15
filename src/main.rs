@@ -1,5 +1,7 @@
 extern crate mio;
 extern crate http_muncher;
+extern crate base64;
+extern crate sha1;
 
 use http_muncher::{Parser, ParserHandler};
 use mio::*;
@@ -8,34 +10,85 @@ use mio::net::*;
 use std::time::Duration;
 
 use std::collections::HashMap;
-use std::io::{Read, ErrorKind};
+use std::io::{Read, ErrorKind, Write};
 use std::io;
+use std::fmt;
 
-struct HttpParser;
+fn gen_key(key: &String) -> String {
+    let mut m = sha1::Sha1::new();
+
+    m.update(key.as_bytes());
+    m.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11".as_bytes());
+
+    base64::encode(&m.digest().bytes())
+}
+
+struct HttpParser {
+    current_key: Option<String>,
+    headers: HashMap<String, String>,
+}
+
 impl ParserHandler for HttpParser {
+    fn on_header_field(&mut self, _parser: &mut Parser, s: &[u8]) -> bool {
+        self.current_key = Some(std::str::from_utf8(s).unwrap().to_string());
+        true
+    }
 
+    fn on_header_value(&mut self, _parser: &mut Parser, s: &[u8]) -> bool {
+        self.headers.insert(self.current_key.clone().unwrap(), std::str::from_utf8(s).unwrap().to_string());
+        true
+    }
 }
 
 impl HttpParser {
     fn new() -> HttpParser {
-        HttpParser { }
+        HttpParser {
+            current_key: None,
+            headers: HashMap::new()
+        }
     }
+}
+
+#[derive(PartialEq)]
+enum ClientState {
+    AwaitingHandshake,
+    HandshakeResponse,
+    Connected
 }
 
 struct WebSocketClient {
     socket: TcpStream,
-    http_parser: Parser,
+    http_parser: HttpParser,
+    state: ClientState,
+    ready: Ready
 }
 
 impl WebSocketClient {
     pub fn new(socket: TcpStream) -> WebSocketClient {
         WebSocketClient {
             socket: socket,
-            http_parser: Parser::request()
+            http_parser: HttpParser::new(),
+            state: ClientState::AwaitingHandshake,
+            ready: Ready::readable() | UnixReady::hup()
         }
     }
 
+    pub fn write(&mut self) {
+        let response_key = gen_key(&self.http_parser.headers.get("Sec-WebSocket-Key").unwrap());
+        let response = fmt::format(format_args!("HTTP/1.1 101 Switching Protocols\r\n\
+                                                 Connection: Upgrade\r\n\
+                                                 Sec-WebSocket-Accept: {}\r\n\
+                                                 Upgrade: websocket\r\n\r\n", response_key));
+        self.socket.write(response.as_bytes()).unwrap();
+
+        self.ready.remove(Ready::writable());
+        self.ready.insert(Ready::readable());
+
+        self.state = ClientState::Connected;
+    }
+
     pub fn read(&mut self) {
+        let mut parser = Parser::request();
         loop {
             let mut buf = [0; 2048];
             match self.socket.read(&mut buf) {
@@ -60,9 +113,14 @@ impl WebSocketClient {
                 },
                 Ok(len) => {
                     println!("Bytes read: {}\nRead {:?}", len, std::str::from_utf8(&buf[0..len]));
-                    self.http_parser.parse(&mut HttpParser::new(), &buf[0..len]);
-                    if self.http_parser.is_upgrade() {
+                    parser.parse(&mut self.http_parser, &buf[0..len]);
+                    if parser.is_upgrade() {
                         println!("Is HTTP upgrade");
+
+                        self.ready.remove(Ready::readable());
+                        self.ready.insert(Ready::writable());
+
+                        self.state = ClientState::HandshakeResponse;
                     }
                 }
             }
@@ -122,7 +180,7 @@ impl WebSocketServer {
         self.token_counter += 1;
         let new_token = Token(self.token_counter);
 
-        poll.register(&client, new_token, Ready::readable() | UnixReady::hup(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+        poll.register(&client, new_token, client.ready, PollOpt::edge() | PollOpt::oneshot()).unwrap();
         self.clients.insert(new_token, client);
     }
 }
@@ -139,24 +197,36 @@ fn main() {
         poll.poll(&mut events, Some(Duration::from_secs(5))).unwrap();
 
         for event in events.iter() {
-            match event.token() {
-                SERVER => {
-                    println!("Received event from websocket");
-                    let _ = websocket.accept(&poll);
-                }
-                token => {
-                    println!("Received event from {:?}", token);
-                    if UnixReady::from(event.readiness()).is_hup() {
-                        websocket.clients.remove(&token);
-                        println!("Removing closed client from clients")
-                    } else {
-                        match websocket.clients.get_mut(&token) {
+            let token = event.token();
+
+            let readiness = event.readiness();
+            if UnixReady::from(readiness).is_hup() {
+                websocket.clients.remove(&token);
+                println!("Removing closed client from clients");
+                continue;
+            }
+
+            if readiness.is_writable() {
+                let mut client = websocket.clients.get_mut(&token).unwrap();
+                client.write();
+                client.reregister(&poll, token, client.ready, PollOpt::edge() | PollOpt::oneshot()).unwrap()
+            }
+
+            if readiness.is_readable() {
+                match token {
+                    SERVER => {
+                        println!("Received event from websocket");
+                        let _ = websocket.accept(&poll);
+                    }
+                    client_token => {
+                        println!("Received event from {:?}", client_token);
+                        match websocket.clients.get_mut(&client_token) {
                             None => {
                                 println!("No client represents this token");
                             },
                             Some(client) => {
                                 client.read();
-                                client.reregister(&poll, token, Ready::readable() | UnixReady::hup(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                                client.reregister(&poll, client_token, client.ready, PollOpt::edge() | PollOpt::oneshot()).unwrap();
                             }
                         }
                     }

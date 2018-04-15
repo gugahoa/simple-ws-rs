@@ -6,3 +6,5 @@ authors = ["Gustavo Aguiar <gugahoa@gmail.com>"]
 [dependencies]
 mio = { git = "https://github.com/carllerche/mio" }
 http-muncher = "0.3"
+sha1 = "0.6.0"
+base64 = "0.9.0"
