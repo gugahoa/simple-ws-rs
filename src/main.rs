@@ -23,6 +23,7 @@ fn gen_key(key: &String) -> String {
     base64::encode(&m.digest().bytes())
 }
 
+#[derive(PartialEq)]
 struct HttpParser {
     current_key: Option<String>,
     headers: HashMap<String, String>,
@@ -51,34 +52,34 @@ impl HttpParser {
 
 #[derive(PartialEq)]
 enum ClientState {
-    AwaitingHandshake,
+    AwaitingHandshake(HttpParser),
     HandshakeResponse,
     Connected
 }
 
 struct WebSocketClient {
     socket: TcpStream,
-    http_parser: HttpParser,
     state: ClientState,
-    ready: Ready
+    ready: Ready,
+    headers: HashMap<String, String>
 }
 
 impl WebSocketClient {
     pub fn new(socket: TcpStream) -> WebSocketClient {
         WebSocketClient {
             socket: socket,
-            http_parser: HttpParser::new(),
-            state: ClientState::AwaitingHandshake,
-            ready: Ready::readable() | UnixReady::hup()
+            state: ClientState::AwaitingHandshake(HttpParser::new()),
+            ready: Ready::readable() | UnixReady::hup(),
+            headers: HashMap::new()
         }
     }
 
     pub fn write(&mut self) {
-        let response_key = gen_key(&self.http_parser.headers.get("Sec-WebSocket-Key").unwrap());
+        let response_key = gen_key(&self.headers.get("Sec-WebSocket-Key").unwrap());
         let response = fmt::format(format_args!("HTTP/1.1 101 Switching Protocols\r\n\
-                                                 Connection: Upgrade\r\n\
-                                                 Sec-WebSocket-Accept: {}\r\n\
-                                                 Upgrade: websocket\r\n\r\n", response_key));
+                                                Connection: Upgrade\r\n\
+                                                Sec-WebSocket-Accept: {}\r\n\
+                                                Upgrade: websocket\r\n\r\n", response_key));
         self.socket.write(response.as_bytes()).unwrap();
 
         self.ready.remove(Ready::writable());
@@ -88,6 +89,17 @@ impl WebSocketClient {
     }
 
     pub fn read(&mut self) {
+        match self.state {
+            ClientState::AwaitingHandshake(_) => {
+                self.read_handshake();
+            },
+            _ => {
+                // Nothing
+            }
+        }
+    }
+
+    pub fn read_handshake(&mut self) {
         let mut parser = Parser::request();
         loop {
             let mut buf = [0; 2048];
@@ -109,13 +121,20 @@ impl WebSocketClient {
                 },
                 Ok(0) => {
                     println!("Socket has no more bytes to read");
-                    break;
                 },
                 Ok(len) => {
                     println!("Bytes read: {}\nRead {:?}", len, std::str::from_utf8(&buf[0..len]));
-                    parser.parse(&mut self.http_parser, &buf[0..len]);
-                    if parser.is_upgrade() {
+                    println!("Buffer bytes: {:?}", &buf[0..len]);
+                    let is_upgrade = if let ClientState::AwaitingHandshake(ref mut http_parser) = self.state {
+                        parser.parse(http_parser, &buf[0..len]);
+                        parser.is_upgrade()
+                    } else { false };
+
+                    if is_upgrade {
                         println!("Is HTTP upgrade");
+                        if let ClientState::AwaitingHandshake(ref http_parser) = self.state {
+                            self.headers = http_parser.headers.clone()
+                        }
 
                         self.ready.remove(Ready::readable());
                         self.ready.insert(Ready::writable());
@@ -201,15 +220,9 @@ fn main() {
 
             let readiness = event.readiness();
             if UnixReady::from(readiness).is_hup() {
-                websocket.clients.remove(&token);
+                websocket.clients.remove(&token); // Shutdown using TcpListener method
                 println!("Removing closed client from clients");
                 continue;
-            }
-
-            if readiness.is_writable() {
-                let mut client = websocket.clients.get_mut(&token).unwrap();
-                client.write();
-                client.reregister(&poll, token, client.ready, PollOpt::edge() | PollOpt::oneshot()).unwrap()
             }
 
             if readiness.is_readable() {
@@ -220,17 +233,17 @@ fn main() {
                     }
                     client_token => {
                         println!("Received event from {:?}", client_token);
-                        match websocket.clients.get_mut(&client_token) {
-                            None => {
-                                println!("No client represents this token");
-                            },
-                            Some(client) => {
-                                client.read();
-                                client.reregister(&poll, client_token, client.ready, PollOpt::edge() | PollOpt::oneshot()).unwrap();
-                            }
-                        }
+                        let mut client = websocket.clients.get_mut(&client_token).unwrap();
+                        client.read();
+                        client.reregister(&poll, client_token, client.ready, PollOpt::edge() | PollOpt::oneshot()).unwrap();
                     }
                 }
+            }
+
+            if readiness.is_writable() {
+                let mut client = websocket.clients.get_mut(&token).unwrap();
+                client.write();
+                client.reregister(&poll, token, client.ready, PollOpt::edge() | PollOpt::oneshot()).unwrap()
             }
         }
     }
