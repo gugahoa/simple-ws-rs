@@ -125,15 +125,14 @@ impl WebSocketClient {
                 Ok(len) => {
                     println!("Bytes read: {}\nRead {:?}", len, std::str::from_utf8(&buf[0..len]));
                     println!("Buffer bytes: {:?}", &buf[0..len]);
-                    let is_upgrade = if let ClientState::AwaitingHandshake(ref mut http_parser) = self.state {
+                    if let ClientState::AwaitingHandshake(ref mut http_parser) = self.state {
                         parser.parse(http_parser, &buf[0..len]);
-                        parser.is_upgrade()
-                    } else { false };
+                    }
 
-                    if is_upgrade {
+                    if parser.is_upgrade() {
                         println!("Is HTTP upgrade");
                         if let ClientState::AwaitingHandshake(ref http_parser) = self.state {
-                            self.headers = http_parser.headers.clone()
+                            self.headers = http_parser.headers.clone();
                         }
 
                         self.ready.remove(Ready::readable());
