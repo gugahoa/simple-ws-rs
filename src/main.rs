@@ -2,6 +2,7 @@ extern crate mio;
 extern crate http_muncher;
 extern crate base64;
 extern crate sha1;
+extern crate ws;
 
 use http_muncher::{Parser, ParserHandler};
 use mio::*;
@@ -13,6 +14,8 @@ use std::collections::HashMap;
 use std::io::{Read, ErrorKind, Write};
 use std::io;
 use std::fmt;
+
+use ws::frame::WebSocketFrame;
 
 fn gen_key(key: &String) -> String {
     let mut m = sha1::Sha1::new();
@@ -75,6 +78,15 @@ impl WebSocketClient {
     }
 
     pub fn write(&mut self) {
+        match self.state {
+            ClientState::HandshakeResponse => {
+                self.write_handshake();
+            },
+            _ => {}
+        }
+    }
+
+    pub fn write_handshake(&mut self) {
         let response_key = gen_key(&self.headers.get("Sec-WebSocket-Key").unwrap());
         let response = fmt::format(format_args!("HTTP/1.1 101 Switching Protocols\r\n\
                                                 Connection: Upgrade\r\n\
@@ -92,6 +104,29 @@ impl WebSocketClient {
         match self.state {
             ClientState::AwaitingHandshake(_) => {
                 self.read_handshake();
+            },
+            ClientState::Connected => {
+                loop {
+                    let frame = WebSocketFrame::read(&mut self.socket);
+                    match frame {
+                        Ok(frame) => println!("{:?}", frame),
+                        Err(e) => {
+                            match e.kind() {
+                                ErrorKind::Interrupted => {
+                                    println!("Read interrupted, try again");
+                                },
+                                ErrorKind::WouldBlock => {
+                                    println!("Socket read would block, returning");
+                                    return;
+                                },
+                                _ => {
+                                    println!("Read socket error. {:?}", e.kind());
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
             },
             _ => {
                 // Nothing
@@ -164,7 +199,8 @@ impl Evented for WebSocketClient  {
     fn deregister(&self, poll: &Poll) -> io::Result<()> {
         // Delegate the `deregister` call to `socket`
         poll.deregister(&self.socket)
-    }}
+    }
+}
 
 const SERVER: Token = Token(0);
 
