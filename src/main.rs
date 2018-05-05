@@ -64,7 +64,8 @@ struct WebSocketClient {
     socket: TcpStream,
     state: ClientState,
     ready: Ready,
-    headers: HashMap<String, String>
+    headers: HashMap<String, String>,
+    outgoing: Vec<WebSocketFrame>
 }
 
 impl WebSocketClient {
@@ -73,7 +74,8 @@ impl WebSocketClient {
             socket: socket,
             state: ClientState::AwaitingHandshake(HttpParser::new()),
             ready: Ready::readable() | UnixReady::hup(),
-            headers: HashMap::new()
+            headers: HashMap::new(),
+            outgoing: Vec::new()
         }
     }
 
@@ -81,6 +83,20 @@ impl WebSocketClient {
         match self.state {
             ClientState::HandshakeResponse => {
                 self.write_handshake();
+            },
+            ClientState::Connected => {
+                println!("sending {} frames", self.outgoing.len());
+
+                for frame in self.outgoing.iter() {
+                    if let Err(e) = frame.write(&mut self.socket) {
+                        println!("error on write: {}", e);
+                    }
+                }
+
+                self.outgoing.clear();
+
+                self.ready.remove(Ready::writable());
+                self.ready.insert(Ready::readable());
             },
             _ => {}
         }
@@ -109,7 +125,19 @@ impl WebSocketClient {
                 loop {
                     let frame = WebSocketFrame::read(&mut self.socket);
                     match frame {
-                        Ok(frame) => println!("{:?}", frame),
+                        Ok(frame) => {
+                            println!("{:?}", frame);
+
+                            // Add a reply frame to the queue:
+                            let reply_frame = WebSocketFrame::from("Hi there!");
+                            self.outgoing.push(reply_frame);
+
+                            // Switch the event subscription to the write mode if the queue is not empty:
+                            if self.outgoing.len() > 0 {
+                                self.ready.remove(Ready::readable());
+                                self.ready.insert(Ready::writable());
+                            }
+                        }
                         Err(e) => {
                             match e.kind() {
                                 ErrorKind::Interrupted => {
