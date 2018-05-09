@@ -118,46 +118,46 @@ impl WebSocketClient {
 
     pub fn read(&mut self) {
         match self.state {
-            ClientState::AwaitingHandshake(_) => {
-                self.read_handshake();
-            },
-            ClientState::Connected => {
-                loop {
-                    let frame = WebSocketFrame::read(&mut self.socket);
-                    match frame {
-                        Ok(frame) => {
-                            println!("{:?}", frame);
+            ClientState::AwaitingHandshake(_) => self.read_handshake(),
+            ClientState::Connected => self.read_frame(),
+            _ => {
+                // Nothing
+            }
+        }
+    }
 
-                            // Add a reply frame to the queue:
-                            let reply_frame = WebSocketFrame::from("Hi there!");
-                            self.outgoing.push(reply_frame);
+    pub fn read_frame(&mut self) {
+        loop {
+            let frame = WebSocketFrame::read(&mut self.socket);
+            match frame {
+                Ok(frame) => {
+                    println!("{:?}", frame);
 
-                            // Switch the event subscription to the write mode if the queue is not empty:
-                            if self.outgoing.len() > 0 {
-                                self.ready.remove(Ready::readable());
-                                self.ready.insert(Ready::writable());
-                            }
-                        }
-                        Err(e) => {
-                            match e.kind() {
-                                ErrorKind::Interrupted => {
-                                    println!("Read interrupted, try again");
-                                },
-                                ErrorKind::WouldBlock => {
-                                    println!("Socket read would block, returning");
-                                    return;
-                                },
-                                _ => {
-                                    println!("Read socket error. {:?}", e.kind());
-                                    return;
-                                }
-                            }
+                    // Add a reply frame to the queue:
+                    let reply_frame = WebSocketFrame::from("Hi there!");
+                    self.outgoing.push(reply_frame);
+
+                    // Switch the event subscription to the write mode if the queue is not empty:
+                    if self.outgoing.len() > 0 {
+                        self.ready.remove(Ready::readable());
+                        self.ready.insert(Ready::writable());
+                    }
+                }
+                Err(e) => {
+                    match e.kind() {
+                        ErrorKind::Interrupted => {
+                            println!("Read interrupted, try again");
+                        },
+                        ErrorKind::WouldBlock => {
+                            println!("Socket read would block, returning");
+                            return;
+                        },
+                        _ => {
+                            println!("Read socket error. {:?}", e.kind());
+                            return;
                         }
                     }
                 }
-            },
-            _ => {
-                // Nothing
             }
         }
     }
